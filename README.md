@@ -119,4 +119,4 @@ MIT
 
 ## Demo Video
 
-[Watch the HELmR Demo](Helmr Demo Video.mp4)
+[Watch the HELmR Demo](helmr-demo.mp4)
