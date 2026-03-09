@@ -1,0 +1,14 @@
+{
+  "agent_id": "agent_test",
+  "mission_id": "m1",
+  "created_at": 1773004500,
+  "lifespan_seconds": 86400,
+  "allowed_actions": [
+    "write_file"
+  ],
+  "allowed_target_prefixes": [
+    "workspace/"
+  ],
+  "max_files_written": 10,
+  "max_spend_usd": 100.0
+}

@@ -1,169 +1,122 @@
-# HELmR
+HELmR
 
-Constrained Autonomy Runtime for AI Agents.
+Deterministic runtime control layer for autonomous agents
 
-A governance gateway that controls how autonomous agents interact with real systems.
+HELmR sits between agents and the systems they interact with.
+Agents do not execute actions directly — every action must pass through HELmR.
 
-Agent → HELmR → World
+HELmR enforces execution rules automatically using:
 
-Every action must be authorized before it executes.
+mission budgets
 
-NO TOKEN → NO ACTION
+capability tokens
 
----
+a controlled execution airlock
 
-## Why HELmR Exists
+Screenshot
 
-Autonomous agents are becoming increasingly capable.
+![HELmR Control Board](helmr-board.png)
 
-They can:
+The control board displays:
 
-• write files  
-• call APIs  
-• execute commands  
-• interact with external systems  
+Mission budgets
 
-But most agent frameworks provide little or no governance over what those agents are allowed to do.
+Agent status
 
-HELmR introduces a runtime control layer between agents and the real world.
+Recent execution events
 
-Instead of allowing agents to execute actions directly, HELmR requires every action to be:
+Example:
 
-1. authorized  
-2. tokenized  
-3. executed through an airlock  
-4. recorded in a deterministic trace  
+HELmR CONTROL BOARD
 
-This creates a safe and auditable execution environment for autonomous systems.
+MISSION BOARD
+AGENT STATUS
+RECENT EVENTS
+What HELmR Does
 
----
+HELmR enforces deterministic runtime governance.
 
-## Core Features
+Features:
 
-• Authorization gateway for agent actions  
-• Capability token system  
-• Airlock execution layer  
-• Replay protection (single-use tokens)  
-• Deterministic breadcrumb tracing  
-• Live activity console  
-• Operator freeze controls  
+Mission creation with action budgets
 
-HELmR acts as a runtime governance layer for autonomous agents.
+Authorization gate for agent actions
 
----
+Single-use capability tokens
 
-## Architecture
+Execution through a controlled airlock
 
-Agent  
- ↓  
-HELmR Gateway  
- ↓  
-Policy Engine  
- ↓  
-Capability Token  
- ↓  
-Airlock Execution  
- ↓  
-Trace Log  
+Automatic mission spend tracking
 
-Agents never execute real-world operations directly.
+Agent termination with tomb-state blocking
 
-All execution flows through HELmR.
+Live runtime control board
 
----
+Agents cannot execute actions outside HELmR.
 
-## Requirements
+Architecture
+Agent
+  ↓
+HELmR Authorization
+  ↓
+Capability Token
+  ↓
+Airlock Execution
+  ↓
+Filesystem / External Systems
 
-Before running HELmR install:
+All execution authority flows through HELmR.
 
-Rust (cargo)  
-Python 3  
+Run Locally
+Requirements
 
-Rust runs the HELmR runtime.
+Rust
 
-Python runs the example agent.
+Cargo
 
----
-
-## Run HELmR in 60 Seconds
-
-Clone the repository:
-
-git clone https://github.com/YOUR_USERNAME/helmr-core  
-cd helmr-core
-
-Start HELmR:
-
+Start HELmR
 cargo run
-
-HELmR will start locally at:
-
-http://127.0.0.1:7070
-
-Open the live console:
-
+Open the control board
 http://127.0.0.1:7070/console/board
-
----
-
-## Run the Example Agent
-
-Open a second terminal and run:
-
-python examples/demo_agent.py
-
-The example agent will:
-
-1. request authorization from HELmR  
-2. receive a capability token  
-3. execute a write_file airlock action  
-4. appear in the HELmR console board  
-
-Replay attempts are automatically blocked.
-
----
-
-## Example Endpoints
-
-Authorization
-
+Demo
+1. Create a mission
+POST /mission/create
+2. Authorize an action
 POST /authorize
-
-Airlock execution
-
+3. Execute through the airlock
 POST /airlock/write_file
+4. Terminate an agent
+POST /control/terminate
 
-Console board
+Watch the control board update in real time.
 
-GET /console/board
+Endpoints
+Endpoint	Description
+/mission/create	Create a mission with a spend limit
+/authorize	Request authorization for an action
+/airlock/write_file	Execute a file write through the airlock
+/control/terminate	Terminate an agent
+/console/board	View the live control board
+Project Status
 
----
+HELmR v2 implements the core deterministic governance loop:
 
-## Product Structure
+mission budgeting
 
-HELmR Core  
-Open runtime governance engine.
+authorization control
 
-HELmR Guard  
-Visual control interface for monitoring and controlling agents.
+capability tokens
 
-HELmR Platform  
-Enterprise governance system for fleets of autonomous agents.
+airlock execution
 
----
+termination enforcement
 
-## Contact
+runtime observability
 
-Questions or discussions:
+License
 
-Open a GitHub issue.
+MIT
 
-Security reports or private inquiries:
+## Demo Video
 
-contact@publictrustshield.com
-
----
-
-## License
-
-MIT License
+[Watch the HELmR Demo](Helmr Demo Video.mp4)

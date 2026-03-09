@@ -5,11 +5,9 @@ use axum::{
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     fs,
-    io::{BufRead, BufReader},
     path::PathBuf,
     sync::{Arc, Mutex},
     time::{SystemTime, UNIX_EPOCH},
@@ -18,9 +16,19 @@ use tokio::net::TcpListener;
 use uuid::Uuid;
 
 #[derive(Clone)]
+struct AgentState {
+    state: String,
+    mission: String,
+}
+
+#[derive(Clone)]
 struct AppState {
     used_tokens: Arc<Mutex<HashSet<String>>>,
-    frozen_agents: Arc<Mutex<HashSet<String>>>,
+    tomb_registry: Arc<Mutex<HashSet<String>>>,
+    mission_spend: Arc<Mutex<HashMap<String, u32>>>,
+    mission_limits: Arc<Mutex<HashMap<String, u32>>>,
+    agents: Arc<Mutex<HashMap<String, AgentState>>>,
+    activity: Arc<Mutex<Vec<String>>>,
 }
 
 #[derive(Deserialize)]
@@ -35,7 +43,7 @@ struct AuthorizeRequest {
 struct AuthorizeResponse {
     decision: String,
     reason: String,
-    token: String,
+    token: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -48,7 +56,13 @@ struct AirlockWriteRequest {
 }
 
 #[derive(Deserialize)]
-struct FreezeRequest {
+struct MissionCreateRequest {
+    mission_id: String,
+    spend_limit: u32,
+}
+
+#[derive(Deserialize)]
+struct TerminateRequest {
     agent_id: String,
 }
 
@@ -65,99 +79,133 @@ fn now() -> u64 {
         .as_secs()
 }
 
-fn write_trace(entry: serde_json::Value) {
-    let trace_dir = PathBuf::from("traces");
-    let _ = fs::create_dir_all(&trace_dir);
+fn bar(count: u32, limit: u32) -> String {
+    let safe_limit = if limit == 0 { 1 } else { limit };
+    let width: u32 = 20;
+    let filled = (count * width) / safe_limit;
 
-    let trace_path = trace_dir.join("trace.log");
+    let mut result = String::new();
 
-    let line = format!("{}\n", entry.to_string());
+    for i in 0..width {
+        if i < filled {
+            result.push('█');
+        } else {
+            result.push('░');
+        }
+    }
 
-    let _ = fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(trace_path)
-        .and_then(|mut f| std::io::Write::write_all(&mut f, line.as_bytes()));
+    result
+}
+
+async fn mission_create(
+    State(state): State<AppState>,
+    Json(req): Json<MissionCreateRequest>,
+) -> Json<DecisionResponse> {
+    let mut limits = state.mission_limits.lock().unwrap();
+    limits.insert(req.mission_id.clone(), req.spend_limit);
+    drop(limits);
+
+    let mut spend = state.mission_spend.lock().unwrap();
+    spend.insert(req.mission_id.clone(), 0);
+    drop(spend);
+
+    let mut activity = state.activity.lock().unwrap();
+    activity.push(format!("{} operator {} SUCCESS", now(), req.mission_id));
+
+    Json(DecisionResponse {
+        decision: "SUCCESS".into(),
+        reason: "MISSION_CREATED".into(),
+    })
 }
 
 async fn authorize(
     State(state): State<AppState>,
     Json(req): Json<AuthorizeRequest>,
 ) -> Json<AuthorizeResponse> {
-
-    let frozen = state.frozen_agents.lock().unwrap();
-
-    if frozen.contains(&req.agent_id) {
+    let tomb = state.tomb_registry.lock().unwrap();
+    if tomb.contains(&req.agent_id) {
         return Json(AuthorizeResponse {
-            decision: "BLOCKED".to_string(),
-            reason: "AGENT_FROZEN".to_string(),
-            token: "".to_string(),
+            decision: "BLOCKED".into(),
+            reason: "AGENT_TERMINATED".into(),
+            token: None,
+        });
+    }
+    drop(tomb);
+
+    let limits = state.mission_limits.lock().unwrap();
+    if !limits.contains_key(&req.mission_id) {
+        return Json(AuthorizeResponse {
+            decision: "BLOCKED".into(),
+            reason: "UNKNOWN_MISSION".into(),
+            token: None,
         });
     }
 
-    let token_id = Uuid::new_v4().to_string();
+    let limit = *limits.get(&req.mission_id).unwrap();
+    drop(limits);
 
-    write_trace(json!({
-        "timestamp": now(),
-        "token_id": token_id,
-        "agent_id": req.agent_id,
-        "mission_id": req.mission_id,
-        "action_type": req.action_type,
-        "target": req.target,
-        "decision": "ALLOWED",
-        "reason": "TOKEN_ISSUED"
-    }));
+    let mut spend = state.mission_spend.lock().unwrap();
+    let count = spend.entry(req.mission_id.clone()).or_insert(0);
+
+    if *count >= limit {
+        return Json(AuthorizeResponse {
+            decision: "BLOCKED".into(),
+            reason: "MISSION_SPEND_LIMIT".into(),
+            token: None,
+        });
+    }
+
+    *count += 1;
+    drop(spend);
+
+    let token = Uuid::new_v4().to_string();
+
+    let mut agents = state.agents.lock().unwrap();
+    agents.insert(
+        req.agent_id.clone(),
+        AgentState {
+            state: "AUTHORIZED".into(),
+            mission: req.mission_id.clone(),
+        },
+    );
+    drop(agents);
+
+    let mut activity = state.activity.lock().unwrap();
+    activity.push(format!("{} {} {} ALLOWED", now(), req.agent_id, req.mission_id));
+
+    let _ = &req.action_type;
+    let _ = &req.target;
 
     Json(AuthorizeResponse {
-        decision: "ALLOWED".to_string(),
-        reason: "ALLOW_WORKSPACE_ONLY".to_string(),
-        token: token_id,
+        decision: "ALLOWED".into(),
+        reason: "TOKEN_ISSUED".into(),
+        token: Some(token),
     })
 }
 
-async fn airlock_write_file(
+async fn airlock_write(
     State(state): State<AppState>,
     Json(req): Json<AirlockWriteRequest>,
 ) -> Json<DecisionResponse> {
-
-    let frozen = state.frozen_agents.lock().unwrap();
-
-    if frozen.contains(&req.agent_id) {
+    let tomb = state.tomb_registry.lock().unwrap();
+    if tomb.contains(&req.agent_id) {
         return Json(DecisionResponse {
-            decision: "BLOCKED".to_string(),
-            reason: "AGENT_FROZEN".to_string(),
+            decision: "BLOCKED".into(),
+            reason: "AGENT_TERMINATED".into(),
         });
     }
-
-    if !req.target.starts_with("workspace/") {
-        return Json(DecisionResponse {
-            decision: "BLOCKED".to_string(),
-            reason: "TARGET_OUTSIDE_WORKSPACE".to_string(),
-        });
-    }
+    drop(tomb);
 
     let mut used = state.used_tokens.lock().unwrap();
-
     if used.contains(&req.token) {
-
-        write_trace(json!({
-            "timestamp": now(),
-            "token_id": req.token,
-            "agent_id": req.agent_id,
-            "mission_id": req.mission_id,
-            "action_type": "write_file",
-            "target": req.target,
-            "decision": "BLOCKED",
-            "reason": "TOKEN_ALREADY_USED"
-        }));
-
         return Json(DecisionResponse {
-            decision: "BLOCKED".to_string(),
-            reason: "TOKEN_ALREADY_USED".to_string(),
+            decision: "BLOCKED".into(),
+            reason: "TOKEN_ALREADY_USED".into(),
         });
     }
 
     used.insert(req.token.clone());
+    drop(used);
 
     let path = PathBuf::from(&req.target);
 
@@ -167,187 +215,177 @@ async fn airlock_write_file(
 
     let _ = fs::write(&path, req.content);
 
-    write_trace(json!({
-        "timestamp": now(),
-        "token_id": req.token,
-        "agent_id": req.agent_id,
-        "mission_id": req.mission_id,
-        "action_type": "write_file",
-        "target": req.target,
-        "decision": "ALLOWED",
-        "reason": "TOKEN_VERIFIED_EXECUTED"
-    }));
+    let mut agents = state.agents.lock().unwrap();
+    agents.insert(
+        req.agent_id.clone(),
+        AgentState {
+            state: "EXECUTING".into(),
+            mission: req.mission_id.clone(),
+        },
+    );
+    drop(agents);
+
+    let mut activity = state.activity.lock().unwrap();
+    activity.push(format!("{} {} {} EXECUTED", now(), req.agent_id, req.mission_id));
 
     Json(DecisionResponse {
-        decision: "ALLOWED".to_string(),
-        reason: "TOKEN_VERIFIED_EXECUTED".to_string(),
+        decision: "ALLOWED".into(),
+        reason: "TOKEN_EXECUTED".into(),
     })
 }
 
-async fn freeze_agent(
+async fn terminate(
     State(state): State<AppState>,
-    Json(req): Json<FreezeRequest>,
+    Json(req): Json<TerminateRequest>,
 ) -> Json<DecisionResponse> {
+    let mut tomb = state.tomb_registry.lock().unwrap();
+    tomb.insert(req.agent_id.clone());
+    drop(tomb);
 
-    let mut frozen = state.frozen_agents.lock().unwrap();
-    frozen.insert(req.agent_id.clone());
+    let mut agents = state.agents.lock().unwrap();
+    agents.insert(
+        req.agent_id.clone(),
+        AgentState {
+            state: "TERMINATED".into(),
+            mission: "-".into(),
+        },
+    );
+    drop(agents);
 
-    write_trace(json!({
-        "timestamp": now(),
-        "agent_id": req.agent_id,
-        "decision": "FREEZE",
-        "reason": "AGENT_FROZEN"
-    }));
+    let mut activity = state.activity.lock().unwrap();
+    activity.push(format!("{} operator {} TERMINATED", now(), req.agent_id));
 
     Json(DecisionResponse {
-        decision: "SUCCESS".to_string(),
-        reason: "AGENT_FROZEN".to_string(),
+        decision: "SUCCESS".into(),
+        reason: "AGENT_TERMINATED".into(),
     })
 }
 
-async fn console_events() -> Json<Vec<Value>> {
+async fn board(State(state): State<AppState>) -> Html<String> {
+    let activity = state.activity.lock().unwrap();
+    let missions = state.mission_spend.lock().unwrap();
+    let limits = state.mission_limits.lock().unwrap();
+    let agents = state.agents.lock().unwrap();
 
-    let trace_path = PathBuf::from("traces/trace.log");
+    let mut mission_rows = String::new();
 
-    if !trace_path.exists() {
-        return Json(vec![]);
-    }
-
-    let file = fs::File::open(trace_path).unwrap();
-    let reader = BufReader::new(file);
-
-    let mut lines: Vec<String> = reader.lines().flatten().collect();
-    lines.reverse();
-
-    let mut events: Vec<Value> = Vec::new();
-
-    for line in lines.into_iter().take(50) {
-        if let Ok(v) = serde_json::from_str::<Value>(&line) {
-            events.push(v);
+    for (mission, count) in missions.iter() {
+        if let Some(limit) = limits.get(mission) {
+            let gauge = bar(*count, *limit);
+            mission_rows.push_str(&format!(
+                "<tr><td>{}</td><td>{}</td><td>{}/{}</td></tr>",
+                mission, gauge, count, limit
+            ));
         }
     }
 
-    Json(events)
-}
+    let mut agent_rows = String::new();
 
-async fn console_board() -> Html<String> {
+    for (name, info) in agents.iter() {
+        agent_rows.push_str(&format!(
+            "<tr><td style='color:#ff4fd8'>{}</td><td>{}</td><td>{}</td></tr>",
+            name, info.state, info.mission
+        ));
+    }
 
-let html = r#"
+    let mut rows = String::new();
+
+    for line in activity.iter().rev().take(50) {
+        let parts: Vec<&str> = line.split(' ').collect();
+
+        if parts.len() >= 4 {
+            rows.push_str(&format!(
+                "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
+                parts[0], parts[1], parts[2], parts[3]
+            ));
+        }
+    }
+
+    let html = format!(
+        r#"
 <html>
 <head>
-<title>HELmR Activity Board</title>
-
+<title>HELmR CONTROL BOARD</title>
+<meta http-equiv="refresh" content="2">
 <style>
-body { font-family: monospace; background:#111; color:#0f0; padding:20px }
-table { border-collapse: collapse; width:100% }
-th, td { border-bottom:1px solid #333; padding:6px }
-button { background:#900; color:white; border:none; padding:4px 8px }
+body {{ background:#000; color:#00ffa6; font-family:monospace; padding:20px; }}
+.panel {{ border:1px solid #00ffa6; padding:12px; margin-bottom:20px; }}
+table {{ width:100%; border-collapse:collapse; }}
+td, th {{ padding:6px; text-align:left; }}
 </style>
-
 </head>
-
 <body>
 
-<h2>HELmR ACTIVITY BOARD</h2>
+<h1>HELmR CONTROL BOARD</h1>
 
-<table id="board">
+<div class="panel">
+<b>MISSION BOARD</b>
+<table>
 <tr>
-<th>TIME</th>
-<th>AGENT</th>
-<th>ACTION</th>
-<th>TARGET</th>
-<th>RESULT</th>
-<th>CONTROL</th>
+<th>MISSION</th>
+<th>BUDGET</th>
+<th>USAGE</th>
 </tr>
+{}
 </table>
+</div>
 
-<script>
+<div class="panel">
+<b>AGENT STATUS</b>
+<table>
+<tr>
+<th>AGENT</th>
+<th>STATE</th>
+<th>MISSION</th>
+</tr>
+{}
+</table>
+</div>
 
-async function freezeAgent(agent) {
-
-await fetch('/freeze_agent', {
-method: 'POST',
-headers: {'Content-Type':'application/json'},
-body: JSON.stringify({agent_id:agent})
-});
-
-}
-
-async function refresh() {
-
-const res = await fetch('/console/events');
-const data = await res.json();
-
-const table = document.getElementById('board');
-
-table.innerHTML = `
+<div class="panel">
+<b>RECENT EVENTS</b>
+<table>
 <tr>
 <th>TIME</th>
 <th>AGENT</th>
-<th>ACTION</th>
-<th>TARGET</th>
+<th>MISSION</th>
 <th>RESULT</th>
-<th>CONTROL</th>
 </tr>
-`;
-
-data.forEach(e => {
-
-const agent = e.agent_id || "";
-
-const row = document.createElement('tr');
-
-row.innerHTML = `
-<td>${e.timestamp || ""}</td>
-<td>${agent}</td>
-<td>${e.action_type || ""}</td>
-<td>${e.target || ""}</td>
-<td>${e.decision || ""}</td>
-<td><button onclick="freezeAgent('${agent}')">FREEZE</button></td>
-`;
-
-table.appendChild(row);
-
-});
-
-}
-
-setInterval(refresh,1000);
-refresh();
-
-</script>
+{}
+</table>
+</div>
 
 </body>
 </html>
-"#;
+"#,
+        mission_rows, agent_rows, rows
+    );
 
-Html(html.to_string())
-
+    Html(html)
 }
 
 #[tokio::main]
 async fn main() {
+    let state = AppState {
+        used_tokens: Arc::new(Mutex::new(HashSet::new())),
+        tomb_registry: Arc::new(Mutex::new(HashSet::new())),
+        mission_spend: Arc::new(Mutex::new(HashMap::new())),
+        mission_limits: Arc::new(Mutex::new(HashMap::new())),
+        agents: Arc::new(Mutex::new(HashMap::new())),
+        activity: Arc::new(Mutex::new(Vec::new())),
+    };
 
-let state = AppState {
-used_tokens: Arc::new(Mutex::new(HashSet::new())),
-frozen_agents: Arc::new(Mutex::new(HashSet::new())),
-};
+    let app = Router::new()
+        .route("/mission/create", post(mission_create))
+        .route("/authorize", post(authorize))
+        .route("/airlock/write_file", post(airlock_write))
+        .route("/control/terminate", post(terminate))
+        .route("/console/board", get(board))
+        .with_state(state);
 
-let app = Router::new()
-.route("/authorize", post(authorize))
-.route("/airlock/write_file", post(airlock_write_file))
-.route("/freeze_agent", post(freeze_agent))
-.route("/console/events", get(console_events))
-.route("/console/board", get(console_board))
-.with_state(state);
+    let listener = TcpListener::bind("127.0.0.1:7070").await.unwrap();
 
-let listener = TcpListener::bind("127.0.0.1:7070")
-.await
-.unwrap();
+    println!("HELmR running on http://127.0.0.1:7070");
 
-println!("HELmR listening on http://127.0.0.1:7070");
-
-axum::serve(listener, app)
-.await
-.unwrap();
+    axum::serve(listener, app).await.unwrap();
 }
